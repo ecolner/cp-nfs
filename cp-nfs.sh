@@ -2,30 +2,39 @@
 
 #####################################################################################
 #	Copy NFS
-#	CP-NFS 1.00 freeware	Copyright (c) 2013 Eli Colner
+#	CP-NFS 2.00 freeware	Copyright (c) 2013 Eli Colner
 #
 #	Problem: copying large numbers of files using cp over NFS dramatically crippled
 #	         due to the overhead of TCP/IP per distinct file.
 #
 #	Solution: we create n uncompressed tar archive(s) of the files to be copied on the
-#	          source side before moving over the network, we extract the archive(s) on
+#	          source side... moving each over the network, we extract the archive(s) on
 #	          the target and then do cleanup on both sides.
+#
+#	Performance:
 #
 #	Issues:
 #
 ######################################################################################
 
+TAR_HEADER_SIZE=512;    # tar header 512 bytes
 part_size=1073741824;   # 1GB
-v="";   # verbosity
+v="";    # verbosity
+a="";    # include hidden files
+L="";    # follow symbolic links to final target
+n="";    # don't overwrite existing files at target
 debug=false;
 src="";
 target="";
 tmp="";
+tar_file="";
+tar_size=0;
+split_file="";
 
 function usage() {
    echo "CP-NFS 1.00 freeware\tCopyright (c) 2013 Eli Colner";
    echo;
-   echo "Usage:\t./cp-nfs.sh [options] <source> <target> [-l <bytes>] [-t <path>]";
+   echo "Usage:\t./cp-nfs.sh [options] <source> <target> [-l <bytes>] [--include-hidden]";
    echo "<Options>";
    echo "\t-verbose, -v       be verbose";
    echo "\t-debug, -d         print debug statements";
@@ -34,15 +43,28 @@ function usage() {
    echo "\t                   copying.  Value should be less than the size of the local";
    echo "\t                   partition where your temporary directory lives.  Only one";
    echo "\t                   temporary archive will exist on your HDD at any time during";
-   echo "\t                   copy.  This represents the minimum amount of local disk";
+   echo "\t                   copy - represents the minimum amount of local disk";
    echo "\t                   space required to complete successfully.  Can also use";
    echo "\t                   M[Bytes] or G[Bytes] (default=1G)";
+   echo "<Extended Options>";
+   echo "\t--include-hidden	  include directory entries whose names begin with a dot (.).";
+   echo "\t--follow-symlinks	follow symbolic links to final target (default=skip)";
+   echo "\t--no-overwrite	  prevent overwriting files at target (default=false)";
    echo;
 }
 
 for (( i = 1; i<= $#; i++)); do
     eval arg=\$$i;
     case $arg in
+    	--include-hidden)
+            a="a";
+            ;;
+        --follow-symlinks)
+            L="L";
+            ;;
+        --no-overwrite)
+            n="n";
+            ;;
     	-version | --version)
             echo "CP-NFS 1.00 freeware\tCopyright (c) 2013 Eli Colner";
    			echo;
@@ -154,98 +176,217 @@ for (( i = 1; i<= $#; i++)); do
     esac
 done
 
-available_space=$(df -b ~/flight-paths-local/ | awk '{print $4}' | tail -n 1);
+available_space=$(df -b $src | awk '{print $4}' | tail -n 1);
 if [ $part_size -gt $available_space ]; then
    echo;
-   echo "WARNING: max volume length [${part_size}] is larger than available disk space.";
-   echo "         You may run out of disk space during cp-nfs.  Consider changing.";
+   echo "WARNING: max volume length [${part_size}] is larger than local available disk space.";
+   echo "         You may run out of space during cp-nfs.  See -l";
    echo;
 fi
 
 # complex switches
-tar_c_switches="-c${v}f";
-tar_x_switches="-x${v}f";
-mv_switches="-f${v}";
-rm_switches="-r${v}";
-cp_switches="-n${v}";
+tar_c_switches="-c${v}f";   # [-c create] [-f file mode] [-v verbosity]
+tar_x_switches="-x${v}f";   # [-x extract] [-f file mode] [-v verbosity]
+mv_switches="-f${v}";       # [-f force] [-v verbosity]
+rm_switches="-r${v}";       # [-r recursive subdirs] [-v verbosity]
+cp_switches="-f${n}${v}";   # [-f force] [-n don't overwrite existing file] [-v verbosity]
+ls_switches="-lp${a}R${L}"; # [-l long formt] [-p write '/' after dirs] [-a include hidden]
+                            # [-R recursive subdirs] [-L follow symbolic links to final target]
 
-tmp=`mktemp -dt cp-nfs` || exit 1;
-tmp="${tmp}/";
+function createTar() {
+	local files=$1;
+	# [LOCAL]
+	# tar file(s) to tmp directory
+	tar -C $src $tar_c_switches $tar_file $files;
+}
 
+function extractTar() {
+	# [REMOTE]
+	# move tar over NFS to target
+	mv $mv_switches $tar_file "${target}cp-nfs.tar";
+	# extract tar on target
+	tar -C $target $tar_x_switches "${target}cp-nfs.tar";
+	# delete tar on target
+	rm $rm_switches "${target}cp-nfs.tar";
+}
+
+function finishSplit() {
+	createTar "--files-from ${split_file}"
+	rm $rm_switches $split_file;
+	extractTar
+}
+
+function copyDirectory() {
+	local dir=$1;        # directory
+	
+	# add trailing '/' if missing
+	local i=$((${#dir} - 1));
+	if [ ${dir:i:1} != "/" ]; then
+       local dir="${dir}/";
+    fi
+    
+	for file in $dir*; do
+	   local filename="${file}";
+	   local filename=${filename##*/};
+	   
+	   # --include-hidden
+	   if [ $filename == "\.*" ] && [ $a != "a" ]; then
+	      # skip hidden file
+		  continue;
+	   fi
+	   
+	   if [ -L $file ]; then
+          # --follow-symlinks
+          if [ $L != "L" ]; then
+             #skip symbolic link
+             continue;
+          fi
+          
+          local f=$(readlink "${file}");
+          if [ ! -f $f ]; then
+             # skip orphan link
+             continue;
+	      fi
+	      local file=$f;
+		  local filename="${file}";
+	      local filename=${filename##*/};
+	   fi
+	   
+	   if [ -d $file ]; then
+	      copyDirectory $file;
+	   elif [ -f $file ]; then
+          local relative_path="${dir##$src}";
+          local file_path="${filename}"
+          if [ "${relative_path}" != "" ]; then
+             local file_path="${relative_path}${filename}";
+		  fi
+	   
+          # make sure to respect $part_size
+          local file_size=$(stat -f "%z" "${file}");
+          if [ $file_size -ge $((part_size - TAR_HEADER_SIZE)) ]; then
+          	# single file larger than split size... can't archive
+          	if [ ! -d $target$relative_path ]; then
+	          	mkdir "-p${v}" $target$relative_path
+	        fi
+          	cp $cp_switches $src$file_path $target$relative_path
+          	continue;
+          fi
+          
+          tar_size=$(($tar_size + $file_size));
+	      if [ $tar_size -gt $((part_size - TAR_HEADER_SIZE)) ]; then
+	        finishSplit
+			# reset counter using last seen file size
+			tar_size=$file_size;
+	      fi
+	      
+	      # add last seen file to split list
+		  if [ ! -f $split_file ]; then
+  	        touch $split_file;
+		  fi
+		  echo "${file_path}" >> $split_file;
+	   fi
+	done
+}
+
+function copy() {
+   	# make target directory
+	if [ ! -d $target ]; then
+	   if [ "$v" == "v" ]; then
+		  mkdir -v $target || exit 1;
+	   else
+		  mkdir $target || exit 1;
+	   fi
+	fi
+	
+	# add trailing '/' if missing
+	local i=$((${#src} - 1));
+	if [ ${src:i:1} != "/" ]; then
+       src="${src}/";
+    fi
+	local i=$((${#target} - 1));
+	if [ ${target:i:1} != "/" ]; then
+       target="${target}/";
+    fi
+    
+   copyDirectory $src;
+   
+   # make sure we don't miss any
+   if [ -f $split_file ]; then
+      finishSplit
+   fi
+}
+
+# run
 if [ $debug ]; then
-    echo "Copying... $src to $target in ${part_size} sized parts using $tmp";
-    echo "Using tmp directory -> $tmp";
+    echo "Copying... ${src} -> ${target}";
 fi
 
-for file in $src/*; do
-   filename="${file}";
-   filename=${filename##*/};
-   if [ -d $file ]; then
-      ######################
-      #   COPY DIRECTORY   #
-      ######################
-      total_size=$(ls -la $file/* | awk '{SUM += $5} END {print SUM}');
-      num_parts=$(echo "scale=1; $total_size / $part_size" | bc | awk '{if ($1 % 1 != 0) {print int($1 + 1)} else {print int($1)}}');
-      num_files=$(ls -la $file/* | wc -l | awk '{gsub(/ /, ""); print}')
-      files_per_part=$(echo "scale=1; $num_files / $num_parts" | bc | awk '{if ($1 % 1 != 0) {print int($1 + 1)} else {print int($1)}}')
-      
-      split_count=1;
-      split_file_count=0;
-      for subfile in $file/*; do
-         if [ -f $subfile ]; then
-            split_file="${tmp}${filename}_split${split_count}.tmp";
-            if [ ! -f $split_file ]; then
-               touch $split_file;
-               if [ $debug ] && [ $split_file_count != 0 ]; then
-                  echo "$split_file_count file(s)";
-               fi
-               if [ "$v" == "v" ]; then
-                  echo ">> $split_file";
-               fi
-               split_file_count=0;
-            fi
-            echo ${subfile##*/} >> $split_file;
-            split_file_count=$[$split_file_count + 1];
-            if [ "$split_file_count" -eq "$files_per_part" ]; then
-               split_count=$[$split_count + 1];
-            fi
-         fi
-      done
-      
-      if [ $debug ] && [ $split_file_count != 0 ]; then
-      	echo "$split_file_count file(s)";
-      fi
-      
-      echo;
-      
-      # make target directory
-      if [ "$v" == "v" ]; then
-         mkdir -v $target$filename
-      else
-         mkdir $target$filename
-      fi
-      
-      for tmp_file in $tmp*; do
-          # tar files into tmp directory
-          tar_file="${tmp_file}.tar";
-          tar -C $file $tar_c_switches $tar_file --files-from $tmp_file;
-          
-          # move over NFS to target
-	      mv $mv_switches $tar_file $target$filename;
-	      # extract
-	      tar -C $target$filename $tar_x_switches $target$filename/${tar_file##*/};
-	      # cleanup
-          rm $rm_switches $target$filename/${tar_file##*/};
-      done
-      
-      #cleanup
-      rm $rm_switches $tmp;
-      
-   elif [ -f $file ]; then
-      ######################
-      #     COPY FILE      #
-      ######################
-      cp $cp_switches $file $target$filename;
+if [ -L $src ]; then
+   src=$(readlink "${src}");
+fi
+
+if [ -f $src ]; then
+   ######################
+   #     COPY FILE      #
+   ######################
+   cp $cp_switches $src $target;
+   
+   echo;
+   echo "Done!";
+   echo;
+   echo "Verifying...";
+   size_src=$(du -achk $src | grep total | awk '{print $1}')
+   if [ -f $target ]; then
+      size_target=$(du -achk $target | grep total | awk '{print $1}')
+   else
+      size_target=$(du -achk ${target##*/} | grep total | awk '{print $1}')
+   fi
+   
+   if [ "$size_src" == "$size_target" ]; then
+      echo "SUCCESS $(($size_src * 1024)) bytes copied";
+   else
+      echo "FAILED - see above for reason";
    fi
    echo;
-done
+   echo;
+   
+elif [ -d $src ]; then
+	######################
+	#   COPY DIRECTORY   #
+	######################
+	# make working directory
+    tmp=`mktemp -dt cp-nfs` || exit 1;
+	tmp="${tmp}/";
+	
+	# set working file paths
+	tar_file="${tmp}cp-nfs.tar";
+	split_file="${tmp}cp-nfs.tmp";
+	
+	if [ debug ]; then
+       echo "tmp directory: ${tmp}";
+       echo "volume length: ${part_size}";
+	fi
+	
+	copy;
+	
+	# delete working directory
+	rm $rm_switches $tmp;
+	
+   echo;
+   echo "Done!";
+   echo;
+   echo "Verifying...";
+   size_src=$(du -achk $src | grep total | awk '{print $1}')
+   size_target=$(du -achk $target | grep total | awk '{print $1}')
+   
+   if [ "$size_src" == "$size_target" ]; then
+      echo "SUCCESS $(($size_src * 1024)) bytes copied";
+   else
+      echo "FAILED - see above for reason";
+   fi
+   echo;
+   echo;
+else
+   echo "ERROR: source file is not supported type - file/directory/symlink to supported";
+   exit 1;
+fi
