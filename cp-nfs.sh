@@ -339,7 +339,7 @@ if [ -f $src ]; then
    if [ -f $target ]; then
       size_target=$(du -achk $target | grep total | awk '{print $1}')
    else
-      size_target=$(du -achk ${target##*/} | grep total | awk '{print $1}')
+      size_target=$(du -achk ${target}${src##*/} | grep total | awk '{print $1}')
    fi
    
    if [ "$size_src" == "$size_target" ]; then
